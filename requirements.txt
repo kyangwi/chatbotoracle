@@ -1,0 +1,24 @@
+# Web Framework
+Django==5.2.15
+
+# Database Drivers & ORM/Querying
+oracledb==4.0.2
+SQLAlchemy==2.0.51
+
+# AI, LangChain, and LangGraph
+langchain-core==1.4.9
+langchain-community==0.4.2
+langchain-google-genai==4.2.7
+langgraph>=0.1.0
+pydantic==2.13.4
+typing_extensions==4.16.0
+
+# Vector DB & Embeddings
+chromadb>=0.4.0
+
+# Data Analysis & Processing
+pandas>=2.0.0
+
+# Configuration & Utilities
+python-dotenv==1.2.2
+requests==2.34.2
