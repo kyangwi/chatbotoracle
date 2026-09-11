@@ -1,0 +1,13 @@
+{
+  "text": "This chatbot provides intelligent financial analytics and conversational SQL querying across the National Social Security Fund (NSSF) Uganda General Ledger (staging.proddta_f0911_account_ledger). You can explore transactions, analyze operational expenditure, track vouchers and payments, review balance adjustments, and audit journal entries.",
+  "analysis": "You can run trend analysis, period comparisons (MoM/YoY/QoQ), drill-downs by cost center/business unit (glmcu), natural account (globj), subledger (glsbl), and document type (gldct), monitor expenditure vs budget, generate interactive charts, and export data.",
+  "suggestions": [
+    "What is the total expenditure in the ledger for fiscal year 2021?",
+    "Show the top 10 cost centers by total expenditure.",
+    "What is the monthly expenditure trend for fiscal year 2021?",
+    "Show total voucher payments (PV) grouped by vendor or account.",
+    "Compare total debits and credits for fiscal year 2020 vs 2021.",
+    "Show the largest 10 journal transactions in the ledger."
+  ],
+  "updated_at": "2026-09-09T01:18:37.367522"
+}

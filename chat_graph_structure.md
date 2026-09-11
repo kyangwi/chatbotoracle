@@ -32,6 +32,7 @@ graph TD
     %% Edges
     classify_intent -->|data_overview| handle_data_overview
     classify_intent -->|no_sql| handle_no_sql
+    classify_intent -->|financial_calculation| finalize
     classify_intent -->|sql_query| generate_sql
 
     generate_sql -->|NO_SQL| handle_no_sql

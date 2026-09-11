@@ -9,6 +9,8 @@ SQLAlchemy==2.0.51
 langchain-core==1.4.9
 langchain-community==0.4.2
 langchain-google-genai==4.2.7
+langchain-openai>=0.3.0
+langchain-ollama>=0.2.0
 langgraph>=0.1.0
 pydantic==2.13.4
 typing_extensions==4.16.0

@@ -3,7 +3,7 @@ import json
 import uuid
 import datetime
 from django.shortcuts import render, redirect
-from django.http import JsonResponse
+from django.http import JsonResponse, StreamingHttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.forms import AuthenticationForm, UserCreationForm
@@ -25,7 +25,7 @@ from .utils import (
     build_chart_with_tools,
     warm_dataset_intro_cache
 )
-from .agent_graph import run_agent_graph
+from .agent_graph import run_agent_graph, stream_agent_graph
 
 # ---------------------------------------------------------------------------
 # Auth Views
@@ -244,6 +244,14 @@ def send_message(request):
 
             chat_history = build_langchain_history(msgs)
 
+            # Find the most recent SQL query in the session history for follow-up visual queries
+            last_sql_query = None
+            for m in reversed(msgs):
+                prev_sql = (m.get("metadata") or {}).get("sql_query")
+                if prev_sql:
+                    last_sql_query = prev_sql
+                    break
+
             db = init_database(
                 os.getenv("DB_USER"),
                 os.getenv("DB_PASSWORD"),
@@ -251,25 +259,6 @@ def send_message(request):
             )
 
             timestamp = datetime.datetime.now().isoformat()
-
-            # --- LangGraph agentic pipeline ---
-            agent_result = run_agent_graph(user_message, db, chat_history)
-            response_text = agent_result.response_text
-            sql_query = agent_result.sql_query
-            chart_payload = agent_result.chart_payload
-
-            # If the graph didn't produce a chart but the user wants one,
-            # fall back to checking previous SQL from conversation history
-            if not chart_payload and not sql_query and has_visual_intent(user_message):
-                for msg in reversed(msgs):
-                    prev_sql = (msg.get("metadata") or {}).get("sql_query")
-                    if prev_sql:
-                        sql_query = prev_sql
-                        df = fetch_dataframe(db, prev_sql)
-                        if df is not None and not df.empty:
-                            chart_payload = build_chart_with_tools(user_message, df, prev_sql)
-                        break
-
             user_msg_id = str(uuid.uuid4())
             messages_collection.add(
                 ids=[user_msg_id],
@@ -277,30 +266,65 @@ def send_message(request):
                 documents=[user_message]
             )
 
-            resp_timestamp = datetime.datetime.now().isoformat()
-            bot_msg_id = str(uuid.uuid4())
-            bot_metadata = {"session_id": session_id, "role": "bot", "timestamp": resp_timestamp}
-            if sql_query:
-                bot_metadata["sql_query"] = sql_query
-            messages_collection.add(
-                ids=[bot_msg_id],
-                metadatas=[bot_metadata],
-                documents=[response_text]
-            )
+            def event_stream():
+                bot_msg_id = str(uuid.uuid4())
+                try:
+                    for event in stream_agent_graph(user_message, db, chat_history, last_sql_query=last_sql_query):
+                        event_type = event.get("type")
+                        if event_type in ("status", "token"):
+                            yield f"data: {json.dumps(event)}\n\n"
+                        elif event_type == "done":
+                            response_text = event.get("response_text", "")
+                            sql_query = event.get("sql_query")
+                            chart_payload = event.get("chart_payload")
 
-            if chart_payload:
-                charts_collection.add(
-                    ids=[bot_msg_id],
-                    metadatas=[{"session_id": session_id}],
-                    documents=[json.dumps(chart_payload)]
-                )
+                            # Fallback check for visual intent if chart was not generated
+                            if not chart_payload and not sql_query and has_visual_intent(user_message):
+                                for msg in reversed(msgs):
+                                    prev_sql = (msg.get("metadata") or {}).get("sql_query")
+                                    if prev_sql:
+                                        sql_query = prev_sql
+                                        df = fetch_dataframe(db, prev_sql)
+                                        if df is not None and not df.empty:
+                                            chart_payload = build_chart_with_tools(user_message, df, prev_sql)
+                                        break
 
-            return JsonResponse({
-                "response": [response_text],
-                "chart": chart_payload,
-                "user_message_id": user_msg_id,
-                "bot_message_id": bot_msg_id
-            })
+                            resp_timestamp = datetime.datetime.now().isoformat()
+                            bot_metadata = {"session_id": session_id, "role": "bot", "timestamp": resp_timestamp}
+                            if sql_query:
+                                bot_metadata["sql_query"] = sql_query
+                            messages_collection.add(
+                                ids=[bot_msg_id],
+                                metadatas=[bot_metadata],
+                                documents=[response_text]
+                            )
+
+                            if chart_payload:
+                                charts_collection.add(
+                                    ids=[bot_msg_id],
+                                    metadatas=[{"session_id": session_id}],
+                                    documents=[json.dumps(chart_payload)]
+                                )
+
+                            done_payload = {
+                                "type": "done",
+                                "response": [response_text],
+                                "chart": chart_payload,
+                                "sql_query": sql_query,
+                                "user_message_id": user_msg_id,
+                                "bot_message_id": bot_msg_id
+                            }
+                            yield f"data: {json.dumps(done_payload)}\n\n"
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    err_payload = {"type": "error", "error": str(e)}
+                    yield f"data: {json.dumps(err_payload)}\n\n"
+
+            response = StreamingHttpResponse(event_stream(), content_type="text/event-stream")
+            response['Cache-Control'] = 'no-cache'
+            response['X-Accel-Buffering'] = 'no'
+            return response
 
         except Exception as e:
             import traceback
@@ -365,50 +389,79 @@ def regenerate_message(request):
             user_query = msgs[user_idx]["content"]
             prior_history = build_langchain_history(msgs[:user_idx])
 
+            # Find the most recent SQL query prior to this message
+            last_sql_query = None
+            for m in reversed(msgs[:user_idx]):
+                prev_sql = (m.get("metadata") or {}).get("sql_query")
+                if prev_sql:
+                    last_sql_query = prev_sql
+                    break
+
             db = init_database(
                 os.getenv("DB_USER"), os.getenv("DB_PASSWORD"), os.getenv("DB_NAME")
             )
 
-            # --- LangGraph agentic pipeline (regenerate) ---
-            agent_result = run_agent_graph(user_query, db, prior_history)
-            response_text = agent_result.response_text
-            sql_query = agent_result.sql_query
-            chart_payload = agent_result.chart_payload
-
             bot_message = msgs[target_bot_idx]
             bot_msg_id = bot_message["id"]
-            bot_metadata = dict(bot_message.get("metadata") or {})
-            bot_metadata["timestamp"] = datetime.datetime.now().isoformat()
 
-            messages_collection.update(
-                ids=[bot_msg_id],
-                metadatas=[bot_metadata],
-                documents=[response_text],
-            )
-
-            if chart_payload:
-                charts_collection.upsert(
-                    ids=[bot_msg_id],
-                    metadatas=[{"session_id": session_id}],
-                    documents=[json.dumps(chart_payload)],
-                )
-            else:
+            def event_stream():
                 try:
-                    charts_collection.delete(ids=[bot_msg_id])
-                except Exception:
-                    pass
+                    for event in stream_agent_graph(user_query, db, prior_history, last_sql_query=last_sql_query):
+                        event_type = event.get("type")
+                        if event_type in ("status", "token"):
+                            yield f"data: {json.dumps(event)}\n\n"
+                        elif event_type == "done":
+                            response_text = event.get("response_text", "")
+                            sql_query = event.get("sql_query")
+                            chart_payload = event.get("chart_payload")
 
-            try:
-                feedback_collection.delete(ids=[bot_msg_id])
-            except Exception:
-                pass
+                            bot_metadata = dict(bot_message.get("metadata") or {})
+                            bot_metadata["timestamp"] = datetime.datetime.now().isoformat()
+                            if sql_query:
+                                bot_metadata["sql_query"] = sql_query
 
-            return JsonResponse({
-                "response": [response_text],
-                "chart": chart_payload,
-                "bot_message_id": bot_msg_id,
-                "regenerated": True,
-            })
+                            messages_collection.update(
+                                ids=[bot_msg_id],
+                                metadatas=[bot_metadata],
+                                documents=[response_text],
+                            )
+
+                            if chart_payload:
+                                charts_collection.upsert(
+                                    ids=[bot_msg_id],
+                                    metadatas=[{"session_id": session_id}],
+                                    documents=[json.dumps(chart_payload)],
+                                )
+                            else:
+                                try:
+                                    charts_collection.delete(ids=[bot_msg_id])
+                                except Exception:
+                                    pass
+
+                            try:
+                                feedback_collection.delete(ids=[bot_msg_id])
+                            except Exception:
+                                pass
+
+                            done_payload = {
+                                "type": "done",
+                                "response": [response_text],
+                                "chart": chart_payload,
+                                "sql_query": sql_query,
+                                "bot_message_id": bot_msg_id,
+                                "regenerated": True
+                            }
+                            yield f"data: {json.dumps(done_payload)}\n\n"
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    err_payload = {"type": "error", "error": str(e)}
+                    yield f"data: {json.dumps(err_payload)}\n\n"
+
+            response = StreamingHttpResponse(event_stream(), content_type="text/event-stream")
+            response['Cache-Control'] = 'no-cache'
+            response['X-Accel-Buffering'] = 'no'
+            return response
 
         except Exception as e:
             return JsonResponse({"error": str(e)}, status=500)

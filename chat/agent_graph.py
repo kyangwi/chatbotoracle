@@ -22,12 +22,15 @@ from langchain_core.prompts import ChatPromptTemplate
 from .utils import (
     llm,
     sql_llm,
-    gemini_model,
     normalize_response_text,
+    sanitize_token_stream,
     extract_clean_sql,
     build_data_overview_response,
     build_no_sql_response,
     build_sql_response,
+    stream_data_overview_response,
+    stream_no_sql_response,
+    stream_sql_response,
     get_exchange_rates_context,
     is_data_overview_question,
     is_sql_query_question,
@@ -37,6 +40,7 @@ from .utils import (
     fetch_dataframe,
     get_sql_chain,
 )
+from .financial_tools import parse_and_compute_calculation_request
 
 logger = logging.getLogger("agent_graph")
 
@@ -50,6 +54,7 @@ class IntentType(str, Enum):
     SQL_QUERY = "sql_query"
     NO_SQL = "no_sql"
     DATA_OVERVIEW = "data_overview"
+    FINANCIAL_CALCULATION = "financial_calculation"
 
 
 class IntentClassification(BaseModel):
@@ -132,35 +137,70 @@ def classify_intent(state: dict) -> dict:
     then fall back to LLM if ambiguous. Returns the intent enum value.
     """
     try:
-        user_query = state.get("user_query", "")
+        user_query = (state.get("user_query") or "").strip()
         chat_history = state.get("chat_history", [])
 
-        # Fast-path: use the existing regex heuristics first (zero LLM cost)
+        # Check if this is a direct financial calculation / rate change request
+        try:
+            calc_result = parse_and_compute_calculation_request(user_query)
+            db_keywords = ["table", "database", "f0911", "ledger", "transactions", "records", "voucher", "gl"]
+            if calc_result and not any(kw in user_query.lower() for kw in db_keywords):
+                return {
+                    "intent": IntentType.FINANCIAL_CALCULATION,
+                    "intent_reasoning": "Direct financial calculator / rate change calculation",
+                    "response_text": f"### Financial Calculation Result\n\n{calc_result}\n\n*(Computed using verified financial calculator tool)*",
+                }
+        except Exception:
+            pass
+
+        # Fast-path 1: Data overview heuristics
         if is_data_overview_question(user_query):
             return {
                 "intent": IntentType.DATA_OVERVIEW,
                 "intent_reasoning": "Matched data overview heuristic patterns",
             }
 
+        # Fast-path 2: Direct SQL query heuristics (covers keywords, dates, typos, action words)
         if is_sql_query_question(user_query):
             return {
                 "intent": IntentType.SQL_QUERY,
-                "intent_reasoning": "Matched database-centric heuristic patterns (revenue/sales/trend/monthly/average/KPIs)",
+                "intent_reasoning": "Matched database-centric heuristic patterns",
             }
 
-        # Use LLM for ambiguous cases — ask it to classify with structured output
-        classification_prompt = ChatPromptTemplate.from_template("""
-You are an intent classifier for a business intelligence SQL chatbot.
+        # Fast-path 3: Short follow-up or database action phrases
+        uq_lower = user_query.lower()
+        db_followup_phrases = [
+            "check the database", "query database", "in database", "check db",
+            "give it", "show it", "get it", "pull it", "run it", "tell me more",
+            "what is it", "show me", "give me", "details", "break it down"
+        ]
+        if any(p in uq_lower for p in db_followup_phrases):
+            return {
+                "intent": IntentType.SQL_QUERY,
+                "intent_reasoning": "Matched direct database query action phrase",
+            }
+
+        # Fast-path 4: Pure greetings and small talk (zero LLM cost)
+        pure_greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening", "how are you", "how are you doing", "what can you do", "who are you"]
+        if uq_lower.rstrip("!?. ") in pure_greetings:
+            return {
+                "intent": IntentType.NO_SQL,
+                "intent_reasoning": "Matched conversational greeting",
+            }
+
+        # Use LLM for ambiguous cases — bias heavily towards SQL query
+        classification_prompt = ChatPromptTemplate.from_template("""You are an intent classifier for a business intelligence SQL chatbot for NSSF Uganda.
 Classify the user's message into exactly one of these intents:
 
-- "sql_query": The user wants data from the database (counts, trends, comparisons, 
-  specific records, charts/graphs of data, KPIs, etc.)
-- "no_sql": The user is making small talk, greetings, asking general questions 
-  not about the database, or asking about capabilities
-- "data_overview": The user wants a high-level summary of what the entire dataset 
-  contains (e.g., "what is this data about?", "describe the dataset")
+- "sql_query": The user wants data, records, amounts, revenue, expenses, balances, transactions, counts, trends, comparisons, or is following up on previous data from the database.
+- "no_sql": The user is making casual small talk or greeting (e.g. "hi", "how are you").
+- "data_overview": The user asks for a high-level summary of the entire dataset (e.g. "what is this data about?").
 
-Recent conversation for context:
+CRITICAL ROUTING RULES:
+- When in doubt, ALWAYS choose "sql_query".
+- If the question contains any date, year, month, number, financial concept, entity, or is a follow-up ("check the database", "give it", "tell me more"), choose "sql_query".
+
+Recent conversation context:
 {chat_history}
 
 User message: {question}
@@ -171,12 +211,11 @@ Respond with ONLY a JSON object: {{"intent": "sql_query"|"no_sql"|"data_overview
         chain = classification_prompt | llm | StrOutputParser()
         raw = chain.invoke({
             "question": user_query,
-            "chat_history": str(chat_history[-6:]) if chat_history else "[]",
+            "chat_history": str(chat_history[-4:]) if chat_history else "[]",
         })
 
         # Parse the LLM's JSON response with Pydantic validation
         cleaned = raw.strip()
-        # Extract JSON from potential markdown code blocks
         if "```" in cleaned:
             import re
             json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, re.DOTALL)
@@ -191,10 +230,9 @@ Respond with ONLY a JSON object: {{"intent": "sql_query"|"no_sql"|"data_overview
 
     except Exception as e:
         logger.warning(f"Intent classification failed, defaulting to sql_query: {e}")
-        # Safe default: treat as SQL query (the SQL chain will return NO_SQL if needed)
         return {
             "intent": IntentType.SQL_QUERY,
-            "intent_reasoning": f"Classification failed ({e}), defaulting to sql_query",
+            "intent_reasoning": f"Classification defaulted to sql_query: {e}",
             "node_errors": state.get("node_errors", []) + [f"classify_intent: {e}"],
         }
 
@@ -202,23 +240,37 @@ Respond with ONLY a JSON object: {{"intent": "sql_query"|"no_sql"|"data_overview
 def generate_sql(state: dict) -> dict:
     """
     Node 2 (SQL branch): Generate SQL from the user's question.
-    Uses the existing get_sql_chain but wraps output with validation.
+    Uses the streamlined get_sql_chain with full conversational context.
     """
     try:
         db = state.get("db")
         user_query = state.get("user_query", "")
         chat_history = state.get("chat_history", [])
 
+        # Pass recent history (last 6 turns) so conversational follow-ups have full context
+        recent_history = chat_history[-6:] if chat_history else []
+
+        # If user query is a brief follow-up like "check the database" or "give it",
+        # find the most recent user prompt in history to carry over context
+        effective_query = user_query
+        uq_clean = user_query.lower().strip().rstrip("!?.")
+        if uq_clean in ["check the database", "give it", "show it", "run it", "tell me more", "details", "get it", "pull it"]:
+            for m in reversed(chat_history):
+                content = getattr(m, "content", "") if hasattr(m, "content") else (m.get("content", "") if isinstance(m, dict) else "")
+                role = getattr(m, "type", "") if hasattr(m, "type") else (m.get("role", "") if isinstance(m, dict) else "")
+                if role in ("human", "user") and content and content.lower().strip() != uq_clean:
+                    effective_query = f"{content} ({user_query})"
+                    break
+
         sql_chain = get_sql_chain(db)
         raw_query = sql_chain.invoke({
-            "question": user_query,
-            "chat_history": chat_history,
+            "question": effective_query,
+            "chat_history": recent_history,
         }).strip()
 
         raw_query = extract_clean_sql(raw_query)
 
         if raw_query == "NO_SQL":
-            # The SQL chain decided this doesn't need SQL — reclassify
             return {
                 "intent": IntentType.NO_SQL,
                 "sql_query": None,
@@ -288,13 +340,10 @@ def fix_sql(state: dict) -> dict:
         error_msg = state.get("sql_error", "")
         user_query = state.get("user_query", "")
 
-        fix_prompt = ChatPromptTemplate.from_template("""
-You are an expert Oracle Database engineer. A SQL query failed with an error.
-Fix the query so it executes successfully.
+        fix_prompt = ChatPromptTemplate.from_template("""You are an expert PostgreSQL Database engineer for NSSF Uganda. A SQL query failed with an error.
+Fix the query so it executes successfully on PostgreSQL 13+ against table `staging.proddta_f0911_account_ledger`.
 
 Original user question: {question}
-
-Database schema: {schema}
 
 Failed SQL query:
 {failed_query}
@@ -302,23 +351,31 @@ Failed SQL query:
 Error message:
 {error}
 
-RULES:
-- Output ONLY the corrected SQL query, nothing else
-- Use Oracle Database syntax (compatible with Oracle 11.2) exclusively. Remember we are using Oracle DB, NOT SQL Server. Do not use SQL Server specific syntax, functions, or operators.
-- Do NOT wrap in markdown code blocks
-- Do NOT end the query with a semicolon (;). Oracle driver via SQLAlchemy will throw ORA-00911 for trailing semicolons.
-- Use uppercase for all table and column names since Oracle stores them in UPPERCASE.
-- If the error is about a missing column, check the schema and use the correct column name
-- If the error is about syntax (such as using TOP, LIMIT, GETDATE(), etc.), fix it using Oracle equivalents (ROWNUM, SYSDATE, etc.)
-- If the error is about CLOB datatypes (e.g. ORA-00932: inconsistent datatypes: expected - got CLOB), it means you are using a CLOB column in a GROUP BY, ORDER BY, DISTINCT, JOIN, or comparison directly. Wrap the CLOB column in TO_CHAR(column_name) or CAST(column_name AS VARCHAR2(4000)) to convert it to a varchar2.
-  Example: Use GROUP BY TO_CHAR(country) instead of GROUP BY country.
-- Keep the query as close to the original intent as possible
-""")
+KEY TABLE & COLUMNS:
+Table: staging.proddta_f0911_account_ledger
+- glaa (numeric): Amount in UGX. Revenue/Credits: `glaa < 0` (use `SUM(ABS(glaa))`). Expenses/Debits: `glaa > 0` (use `SUM(glaa)`).
+- gldgj (integer): GL Date (Julian CYDDD format, e.g. 126252). ALWAYS convert with: `TO_DATE((1900000 + gldgj)::text, 'YYYYDDD')`
+- glpost (text): Posting Status ('P'=Posted). Filter `WHERE glpost = 'P'`.
+- glmcu (text): Cost Center / Business Unit (e.g. '999' = Head Office).
+- globj (text): 6-digit Natural Account (e.g. '405014').
+- gldct (text): Document Type ('PV', 'JE', 'RI', 'PM').
+- gldoc (numeric): Document / Voucher Number.
+- glexa (text): Description (use `TRIM(glexa) ILIKE '%term%'`).
+- gluser (text): User who entered the transaction.
+- glco (text): Company code ('00001').
+
+RULES FOR FIXING:
+1. Output ONLY the raw corrected PostgreSQL SQL query. No explanations, no markdown fences, no notes.
+2. Ensure valid PostgreSQL syntax. NEVER use EXTRACT() on Julian integer columns without TO_DATE((1900000 + gldgj)::text, 'YYYYDDD').
+3. If a column does not exist (e.g. undefined column error), remove or replace it with the correct column.
+4. Keep the query focused strictly on answering the original user question.
+5. Limit row count (LIMIT 50) for detailed record listings.
+
+Corrected PostgreSQL Query:""")
 
         chain = fix_prompt | sql_llm | StrOutputParser()
         fixed_query = chain.invoke({
             "question": user_query,
-            "schema": db.get_table_info(),
             "failed_query": original_query,
             "error": error_msg,
         }).strip()
@@ -343,19 +400,15 @@ RULES:
 def handle_sql_error(state: dict) -> dict:
     """
     Terminal error handler: when SQL fails after max retries,
-    generate a helpful response explaining the issue.
+    generate a helpful executive response without exposing internal technical code or SQL.
     """
-    error_msg = state.get("sql_error", "Unknown error")
-    user_query = state.get("user_query", "")
-
     fallback_text = (
-        f"I attempted to query the database for your question but encountered "
-        f"a persistent error after {MAX_SQL_RETRIES} attempts. "
-        f"The issue was: {error_msg}\n\n"
-        f"**Suggestive analysis:**\n"
-        f"- Could you rephrase your question with more specific details?\n"
-        f"- What specific columns or tables are you interested in?\n"
-        f"- Would you like to see the database schema first?\n"
+        "I was unable to retrieve the requested financial data after several attempts. "
+        "The query could not be resolved against the general ledger schema.\n\n"
+        "**Suggestive analysis:**\n"
+        "- Could you rephrase your question with specific fiscal years or natural accounts?\n"
+        "- What specific metrics, document types, or cost centers would you like to analyze?\n"
+        "- Would you like an overview of the available ledger data?\n"
     )
 
     return {
@@ -506,10 +559,12 @@ def finalize(state: dict) -> dict:
 def route_by_intent(state: dict) -> str:
     """Route after classify_intent based on the detected intent."""
     intent = state.get("intent")
-    if intent == IntentType.DATA_OVERVIEW:
+    if intent in (IntentType.DATA_OVERVIEW, "data_overview"):
         return "handle_data_overview"
-    elif intent == IntentType.NO_SQL:
+    elif intent in (IntentType.NO_SQL, "no_sql"):
         return "handle_no_sql"
+    elif intent in (IntentType.FINANCIAL_CALCULATION, "financial_calculation"):
+        return "finalize"
     else:
         return "generate_sql"
 
@@ -519,7 +574,7 @@ def route_after_sql_gen(state: dict) -> str:
     intent = state.get("intent")
     sql_query = state.get("sql_query")
 
-    if intent == IntentType.NO_SQL or not sql_query:
+    if intent in (IntentType.NO_SQL, "no_sql") or not sql_query:
         return "handle_no_sql"
     return "execute_sql"
 
@@ -584,6 +639,7 @@ def _build_agent_graph() -> StateGraph:
             "handle_data_overview": "handle_data_overview",
             "handle_no_sql": "handle_no_sql",
             "generate_sql": "generate_sql",
+            "finalize": "finalize",
         },
     )
 
@@ -687,3 +743,209 @@ def run_agent_graph(user_query: str, db, chat_history: list) -> AgentResponse:
             ),
             error=str(e),
         )
+
+
+
+def stream_agent_graph(user_query: str, db, chat_history: list, last_sql_query: Optional[str] = None):
+    """
+    Stream the full agentic pipeline token-by-token using real-time LLM streaming.
+    Yields dict events:
+      - {"type": "status", "message": "..."}
+      - {"type": "token", "content": "..."}
+      - {"type": "done", "response_text": "...", "sql_query": "...", "chart_payload": {...}, "intent": "..."}
+    """
+    state = {
+        "user_query": user_query,
+        "chat_history": chat_history,
+        "db": db,
+        "sql_retries": 0,
+        "node_errors": [],
+    }
+
+    try:
+        # Step 0: Check if this is a follow-up visualization request for previous data
+        # e.g. "generate a pie chart for the above data", "plot this as a bar chart", "visualize the above"
+        is_followup_visual = has_visual_intent(user_query) and (
+            any(k in user_query.lower() for k in ["above", "this", "previous", "these", "the data", "it"])
+            or not is_sql_query_question(user_query)
+        )
+
+        if is_followup_visual and last_sql_query:
+            yield {"type": "status", "message": "Synthesizing visual financial insights from previous dataset..."}
+            state["sql_query"] = last_sql_query
+            exec_result = execute_sql(state)
+            state.update(exec_result)
+            sql_result = state.get("sql_result", "")
+
+            # Generate chart payload directly
+            df = fetch_dataframe(db, last_sql_query)
+            chart_payload = None
+            if df is not None and not df.empty:
+                chart_payload = build_chart_with_tools(user_query, df, last_sql_query)
+
+            # Stream financial interpretation of the chart
+            yield {"type": "status", "message": "Synthesizing visual financial insights..."}
+            full_text = ""
+            for chunk in sanitize_token_stream(stream_sql_response(user_query, db, chat_history, last_sql_query, sql_result)):
+                if chunk:
+                    full_text += chunk
+                    yield {"type": "token", "content": chunk}
+
+            full_text = normalize_response_text(full_text)
+            yield {
+                "type": "done",
+                "response_text": full_text,
+                "sql_query": last_sql_query,
+                "chart_payload": chart_payload,
+                "intent": "sql_query"
+            }
+            return
+
+        # Step 1: Intent Classification
+        yield {"type": "status", "message": "Analyzing question..."}
+        classified = classify_intent(state)
+        state.update(classified)
+        intent = state.get("intent")
+
+        # Branch 0: Financial Calculator (direct math / variance / CAGR)
+        if intent == IntentType.FINANCIAL_CALCULATION or intent == "financial_calculation":
+            resp_text = state.get("response_text", "")
+            yield {"type": "token", "content": resp_text}
+            yield {
+                "type": "done",
+                "response_text": resp_text,
+                "sql_query": None,
+                "chart_payload": None,
+                "intent": "financial_calculation"
+            }
+            return
+
+        # Branch 1: Data Overview
+        if intent == IntentType.DATA_OVERVIEW or intent == "data_overview":
+            yield {"type": "status", "message": "Synthesizing dataset overview..."}
+            full_text = ""
+            for chunk in sanitize_token_stream(stream_data_overview_response(user_query, db, chat_history)):
+                if chunk:
+                    full_text += chunk
+                    yield {"type": "token", "content": chunk}
+            full_text = normalize_response_text(full_text)
+            yield {
+                "type": "done",
+                "response_text": full_text,
+                "sql_query": None,
+                "chart_payload": None,
+                "intent": "data_overview"
+            }
+            return
+
+        # Branch 2: No-SQL / General Chit-chat (ONLY for pure chit-chat / greetings)
+        if intent == IntentType.NO_SQL or intent == "no_sql":
+            yield {"type": "status", "message": "Generating response..."}
+            full_text = ""
+            for chunk in sanitize_token_stream(stream_no_sql_response(user_query, chat_history)):
+                if chunk:
+                    full_text += chunk
+                    yield {"type": "token", "content": chunk}
+            full_text = normalize_response_text(full_text)
+            yield {
+                "type": "done",
+                "response_text": full_text,
+                "sql_query": None,
+                "chart_payload": None,
+                "intent": "no_sql"
+            }
+            return
+
+        # Branch 3: SQL Query
+        yield {"type": "status", "message": "Generating SQL query from question and context..."}
+        sql_gen_result = generate_sql(state)
+        state.update(sql_gen_result)
+
+        if not state.get("sql_query"):
+            # If the SQL generator could not form a query, do NOT hallucinate fake data!
+            fallback_msg = (
+                "I was unable to construct a valid database query for your question. "
+                "Please specify the metric (e.g. revenue, expenditures), time period (e.g. September 2026, FY2021), "
+                "or cost center you would like to analyze from the NSSF General Ledger."
+            )
+            yield {"type": "token", "content": fallback_msg}
+            yield {
+                "type": "done",
+                "response_text": fallback_msg,
+                "sql_query": None,
+                "chart_payload": None,
+                "intent": "sql_query"
+            }
+            return
+
+        sql_query = state.get("sql_query")
+        yield {"type": "status", "message": "Executing SQL query...", "sql": sql_query}
+        exec_result = execute_sql(state)
+        state.update(exec_result)
+
+        # Self-healing loop if SQL errored
+        while state.get("sql_error") and state.get("sql_retries", 0) < MAX_SQL_RETRIES:
+            retries = state.get("sql_retries", 0) + 1
+            yield {"type": "status", "message": f"Self-healing SQL query (attempt {retries}/{MAX_SQL_RETRIES})..."}
+            fix_result = fix_sql(state)
+            state.update(fix_result)
+            exec_result = execute_sql(state)
+            state.update(exec_result)
+
+        # Persistent error handling
+        if state.get("sql_error"):
+            err_res = handle_sql_error(state)
+            err_text = err_res.get("response_text", "")
+            yield {"type": "token", "content": err_text}
+            yield {
+                "type": "done",
+                "response_text": err_text,
+                "sql_query": state.get("sql_query"),
+                "chart_payload": None,
+                "intent": "sql_query"
+            }
+            return
+
+        # Success path: Synthesize natural language analysis with token streaming
+        yield {"type": "status", "message": "Synthesizing financial analysis..."}
+        full_text = ""
+        sql_result = state.get("sql_result", "")
+        for chunk in sanitize_token_stream(stream_sql_response(user_query, db, chat_history, sql_query, sql_result)):
+            if chunk:
+                full_text += chunk
+                yield {"type": "token", "content": chunk}
+
+        full_text = normalize_response_text(full_text)
+        state["response_text"] = full_text
+
+        # Generate chart if applicable
+        chart_result = maybe_generate_chart(state)
+        chart_payload = chart_result.get("chart_payload")
+
+        yield {
+            "type": "done",
+            "response_text": full_text,
+            "sql_query": sql_query,
+            "chart_payload": chart_payload,
+            "intent": "sql_query"
+        }
+
+    except Exception as e:
+        logger.error(f"Agent graph streaming failed: {traceback.format_exc()}")
+        fallback_text = (
+            "I encountered an unexpected error processing your request. "
+            "Please try rephrasing your question or ask something else.\n\n"
+            "**Suggestive analysis:**\n"
+            "- What tables are in this database?\n"
+            "- Show me a summary of the data\n"
+            "- What are the top KPIs?\n"
+        )
+        yield {"type": "token", "content": fallback_text}
+        yield {
+            "type": "done",
+            "response_text": fallback_text,
+            "sql_query": state.get("sql_query"),
+            "chart_payload": None,
+            "intent": "error",
+            "error": str(e)
+        }
